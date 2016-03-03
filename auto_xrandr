@@ -1,0 +1,118 @@
+#!/usr/bin/python
+#
+# Copyright (c) 2013 Apollon Oikonomopoulos <apoikos@dmesg.gr>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import re
+import sys
+import time
+import errno
+import pyudev
+import subprocess
+
+from setproctitle import setproctitle
+
+topology = { "DP1": ("left-of", "eDP1") }
+flags = { "DP1": ["primary"] }
+
+output_re = re.compile(r'^(?P<output>\w+) (?P<state>connected|disconnected) (?P<geom>[0-9]+x[0-9]+\+[0-9]+\+[0-9]+)?.*')
+mode_re = re.compile(r'^\s+(?P<mode>[0-9]+x[0-9]+)\s+[0-9]+\.[0-9]+(?P<flags>..).*')
+
+def handle_change():
+    outputs = []
+    current_output = None
+    current_mode = None
+    current_state = None
+
+    for line in subprocess.check_output(["/usr/bin/xrandr", "-q"]).splitlines():
+        m = output_re.match(line)
+        if m:
+            if current_output:
+                outputs.append((current_output, current_mode, current_state))
+
+            current_output = m.group("output")
+            current_state = m.group("state")
+            current_mode = m.group("geom")
+
+        m = mode_re.match(line)
+        if m:
+            if '+' in m.group("flags"):
+                current_mode = m.group("mode")
+
+    outputs.append((current_output, current_mode, current_state))
+
+    args = []
+
+    for output in (x[0] for x in outputs if x[2] == "disconnected"):
+        sys.stderr.write("%s disconnected\n" % output)
+        args += ["--output", output, "--off"]
+
+    outputs = [x for x in outputs if x[2] == "connected"]
+
+    for output, mode, _ in outputs:
+        args += ["--output", output, "--mode", mode]
+        if output in topology:
+            pos, other =  topology[output]
+            if other in [x[0] for x in outputs]:
+                args += ["--%s" % pos, other]
+
+        if output in flags:
+            args += ["--%s" % f for f in flags[output]]
+
+    subprocess.check_call(["/usr/bin/xrandr"] + args)
+    if len(outputs) == 1:
+        dpi = 120
+    else:
+        dpi = 96
+        adjust_brightness(100)
+
+    subprocess.check_call(["/usr/bin/xrandr", "--dpi", str(dpi)])
+
+
+def adjust_brightness(level):
+    subprocess.check_call(["xbacklight", "-set", str(level)])
+
+
+def watch():
+    context = pyudev.Context()
+    monitor = pyudev.Monitor.from_netlink(context)
+    monitor.filter_by("drm")
+
+    while True:
+        try:
+            for action, device in monitor:
+                if action == "change" and device.get("HOTPLUG", "0") == "1":
+                    time.sleep(1)
+                    print "Monitor hotplug event detected, calling xrandr"
+                    handle_change()
+        except IOError as e:
+            if e.errno == errno.EINTR:
+                pass
+            else:
+                raise
+
+
+if __name__ == "__main__":
+    setproctitle("auto_xrandr")
+    handle_change()
+    try:
+        watch()
+    except KeyboardInterrupt:
+        sys.exit(0)
